@@ -1,7 +1,6 @@
 import logging
-import random
 from contextlib import asynccontextmanager
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.exceptions import (
@@ -23,16 +22,6 @@ SERVICE_NAME = "star"
 ROUTE_PREFIX = f"/{SERVICE_NAME}"
 PROXY_URL = None
 
-STARHUB_CDNS = [
-    "CO2-BKS400-04.starhubgo.com:443",
-    "CO2-BKS400-05.starhubgo.com:443",
-    "MH-BKS400-07.starhubgo.com:443",
-    # "bks03.starhubgo.com",
-    "mh-bks400-06.starhubgo.com",
-    "SH-BKS400-11.starhubgo.com:443",
-    "RCG-BKS400-06.starhubgo.com:443",
-    "sh-bks400-08.starhubgo.com:443",
-]
 
 
 CHANNELS = {
@@ -306,13 +295,14 @@ CHANNELS = {
 }
 
 CORS_HEADERS = {
+    "Cache-Control": "no-store",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, OPTIONS",
     "Access-Control-Allow-Headers": "*",
 }
 
 UPSTREAM_HEADERS = {}
-MAX_RESOLVE_ATTEMPTS = 3
+MAX_RESOLVE_ATTEMPTS = 1
 STARHUB_UPSTREAM_TIMEOUT = 20.0
 # StarHub's CDN performs TLS fingerprinting, so impersonate a real browser.
 UPSTREAM_IMPERSONATE = "chrome"
@@ -328,8 +318,6 @@ logger = logging.getLogger(__name__)
 
 def build_public_error_message(exc):
     if isinstance(exc, HTTPException):
-        if exc.status_code >= 500:
-            return "Internal server error"
         return str(exc.detail or "Request failed")
     if isinstance(exc, CurlTimeout):
         return "Upstream request timed out"
@@ -370,57 +358,24 @@ def detect_stream_type(url: str) -> str:
     return ""
 
 
-def rewrite_stream_url_with_random_cdn(url: str) -> str:
-    normalized = str(url or "").strip()
-    if not normalized:
-        return ""
-    parsed = urlparse(normalized)
-    if not parsed.scheme or not parsed.netloc:
-        return normalized
-    selected_cdn = random.choice(STARHUB_CDNS)
-    return parsed._replace(netloc=selected_cdn).geturl()
+def validate_upstream_url(url):
+    """Only follow HTTPS redirects within the provider's domain."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if (parsed.scheme != "https" or parsed.username or parsed.password
+            or not (host == "starhubgo.com" or host.endswith(".starhubgo.com"))
+            or parsed.port not in (None, 443)):
+        raise HTTPException(502, "Upstream returned an unexpected redirect destination")
+    return url
 
 
-def has_tokenized_url(url):
-    normalized = str(url or "").strip()
-    return "/bpk-token/" in normalized and "bkm-query" in normalized
-
-
-def extract_bpk_token(url):
-    normalized = str(url or "").strip()
-    if not normalized:
-        return ""
-
-    parsed = urlparse(normalized)
-    parts = [part for part in parsed.path.split("/") if part]
+def is_manifest_response(response):
+    # Do not mistake a camouflage page or HTTP 200 error page for an MPD.
+    import xml.etree.ElementTree as ET
     try:
-        token_index = parts.index("bpk-token") + 1
-    except ValueError:
-        token_index = -1
-    if 0 <= token_index < len(parts):
-        return parts[token_index]
-    return ""
-
-
-def extract_tokenized_stream_url(response):
-    candidates = [str(getattr(response, "url", "") or "").strip()]
-    for item in getattr(response, "history", []) or []:
-        candidates.append(str(getattr(item, "url", "") or "").strip())
-        location = (
-            item.headers.get("location") or item.headers.get("Location") or ""
-        ).strip()
-        if location:
-            candidates.append(location)
-    final_location = (
-        response.headers.get("location") or response.headers.get("Location") or ""
-    ).strip()
-    if final_location:
-        candidates.append(final_location)
-
-    for candidate in candidates:
-        if candidate and has_tokenized_url(candidate):
-            return candidate
-    return ""
+        return ET.fromstring(response.content).tag.rsplit("}", 1)[-1] == "MPD"
+    except (ET.ParseError, ValueError):
+        return False
 
 
 async def resolve_stream_url(channel_key):
@@ -428,49 +383,42 @@ async def resolve_stream_url(channel_key):
 
 
 async def resolve_stream_url_with_proxy(channel_key, upstream_proxy):
-    manifest_url = CHANNELS[channel_key]["manifest_url"]
-    logger.info(
-        "Resolving StarHub stream | channel_key=%s | manifest_url=%s | proxy=%s",
-        channel_key,
-        manifest_url,
-        upstream_proxy or "DIRECT",
-    )
-
+    current_url = validate_upstream_url(CHANNELS[channel_key]["manifest_url"])
+    visited = set()
     async with AsyncSession(
         proxy=upstream_proxy or None,
-        allow_redirects=True,
+        allow_redirects=False,
         timeout=STARHUB_UPSTREAM_TIMEOUT,
         verify=True,
         impersonate=UPSTREAM_IMPERSONATE,
     ) as client:
-        response = await client.get(
-            manifest_url,
-        )
-
-    tokenized_url = extract_tokenized_stream_url(response)
-    logger.info(
-        "StarHub upstream response | channel_key=%s | status=%s | response_url=%s | tokenized_url=%s",
-        channel_key,
-        response.status_code,
-        response.url,
-        tokenized_url,
-    )
-
-    if response.status_code >= 400:
-        response.raise_for_status()
-
-    if not tokenized_url:
-        raise RuntimeError("Upstream response did not yield tokenized stream URL")
-
-    rewritten_location = rewrite_stream_url_with_random_cdn(tokenized_url)
-    logger.info(
-        "Resolved StarHub stream | channel_key=%s | stream_url=%s | rewritten_stream_url=%s | bpk_token=%s",
-        channel_key,
-        tokenized_url,
-        rewritten_location,
-        extract_bpk_token(rewritten_location or tokenized_url),
-    )
-    return rewritten_location or tokenized_url
+        for hop in range(6):
+            if current_url in visited:
+                raise HTTPException(502, "Upstream redirect loop")
+            visited.add(current_url)
+            response = await client.get(current_url)
+            status = response.status_code
+            logger.warning("Resolver | channel=%s | hop=%s | host=%s | status=%s",
+                           channel_key, hop, urlparse(current_url).hostname, status)
+            if status in (301, 302, 303, 307, 308):
+                location = response.headers.get("location") or response.headers.get("Location")
+                if not location:
+                    raise HTTPException(502, "Upstream redirect is missing its Location header")
+                target = validate_upstream_url(urljoin(current_url, location))
+                # Preserve the issued hostname and query exactly. Fetching this signed
+                # URL here is unnecessary for a redirect service and can fail even
+                # when the player is able to use it.
+                if "/bpk-token/" in urlparse(target).path and detect_stream_type(target) == "dash":
+                    return target
+                current_url = target
+                continue
+            if status >= 400:
+                stage = "initial manifest request" if hop == 0 else "redirect hop " + str(hop)
+                raise HTTPException(502, f"Upstream HTTP {status} at {stage}")
+            if status == 200 and is_manifest_response(response):
+                return current_url
+            raise HTTPException(502, "Upstream returned a non-MPD response instead of a manifest")
+    raise HTTPException(502, "Upstream exceeded the redirect limit")
 
 
 class StarHubManifestProxy:
@@ -498,6 +446,7 @@ async def root(_request: Request):
             success=True,
             status_code=200,
             message="starhub-manifest-proxy ready",
+            version="render-fix1",
             endpoints={
                 "get_stream": f"{ROUTE_PREFIX}/get-stream?channel_id=beINSports5",
                 "manifest_redirect": "/FIFAWCCh1/index.mpd",
